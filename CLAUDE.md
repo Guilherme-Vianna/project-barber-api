@@ -10,9 +10,9 @@
 
 Barbershop appointment REST API (FastAPI, three layers), PostgreSQL, Firebase Auth, Redis, Cloud Run; mirrors `project-study-api`.
 
-- Python 3.14, uv (`package = false`), taskipy (`uv run task dev`); FastAPI, Pydantic v2, firebase-admin, tzdata, redis
+- Python 3.14, uv (`package = false`), taskipy; FastAPI, Pydantic v2, firebase-admin, tzdata, redis
 - SQLAlchemy 2.0 async + asyncpg, Alembic; primary keys are UUIDv7 via stdlib `uuid.uuid7`
-- Tests: pytest + pytest-asyncio (auto) + httpx against real Postgres (`app_test`); Firebase and Redis are faked
+- Tests: pytest (asyncio auto) + httpx on real Postgres (`app_test`); Firebase and Redis faked
 
 ## Domain rules
 
@@ -49,7 +49,6 @@ Barbershop appointment REST API (FastAPI, three layers), PostgreSQL, Firebase Au
   `operation`, `valid_from`, `valid_to` (NULL = open version), `changed_by` (`session.info["actor"]`, the uid).
 - An `after_flush` listener writes history. Always mutate through the ORM; bulk statements and DB cascades bypass it.
 - Columns need explicit types (FKs: `mapped_column(Uuid, ForeignKey(...))`). `tests/test_history.py` enforces versioning.
-
 ## Layout
 
 ```
@@ -64,7 +63,6 @@ tests/           conftest, fakes (identity + cache), helpers, one module per res
 docker/          postgres/init (app_test DB); compose also runs redis
 .github/         workflows/deploy.yml (CI + Cloud Run deploy)
 ```
-
 ## Layer rules
 
 - CORS: `CORS_ORIGINS` (comma-separated, default `*`) feeds `CORSMiddleware` in `create_app`.
@@ -95,6 +93,8 @@ uv run alembic revision --autogenerate -m "message" && uv run alembic check
 
 - GitHub Actions: PRs run lint + tests + `alembic check`; pushes to `main` build → Artifact Registry → deploy → smoke
   test. The app creates the database if missing and migrates on startup (`RUN_MIGRATIONS_ON_STARTUP`). Auth via SA key
-  secret `GCP_CREDENTIALS`; `DATABASE_URL`/`REDIS_URL` secrets; `development` env vars; `K_REVISION` namespaces cache.
-- `DATABASE_URL` accepts provider URLs (`postgresql://…?sslmode=…&channel_binding=…`); `Settings` normalizes for asyncpg.
+  secret `GCP_CREDENTIALS` (project id derived from it); `DATABASE_URL`/`REDIS_URL` secrets; region fixed `southamerica-east1`;
+  service/repo default `project-barber-api` (optional vars `CLOUD_RUN_SERVICE`, `GAR_REPOSITORY`, `GCP_SERVICE_ACCOUNT`,
+  `FIREBASE_PROJECT_ID`); `K_REVISION` namespaces cache.
+- `DATABASE_URL` accepts provider URLs (`postgresql://…?sslmode=…`); `Settings` normalizes for asyncpg.
 - `Dockerfile`: multi-stage uv, `python:3.14-slim`, non-root, `$PORT`; no BuildKit-only features.

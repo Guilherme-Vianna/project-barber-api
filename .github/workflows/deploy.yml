@@ -65,43 +65,46 @@ jobs:
       group: deploy-development
       cancel-in-progress: false
     env:
-      IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/${{ vars.CLOUD_RUN_SERVICE }}:${{ github.sha }}
+      REGION: southamerica-east1
+      SERVICE: ${{ vars.CLOUD_RUN_SERVICE || 'project-barber-api' }}
+      GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY || 'project-barber-api' }}
     steps:
       - name: Check configuration
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
-          GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
-          CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
-          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
-          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
         run: |
           missing=()
-          for name in GCP_CREDENTIALS DATABASE_URL GCP_PROJECT_ID GCP_REGION GAR_REPOSITORY \
-            CLOUD_RUN_SERVICE GCP_SERVICE_ACCOUNT FIREBASE_PROJECT_ID; do
+          for name in GCP_CREDENTIALS DATABASE_URL; do
             if [ -z "${!name}" ]; then
               missing+=("$name")
             fi
           done
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error::Missing secrets/variables in the 'development' environment: ${missing[*]}"
+            echo "::error::Missing secrets in the 'development' environment: ${missing[*]}"
             exit 1
           fi
 
       - uses: actions/checkout@v7
 
       - name: Authenticate to Google Cloud
+        id: auth
         uses: google-github-actions/auth@v3
         with:
           credentials_json: ${{ secrets.GCP_CREDENTIALS }}
 
       - uses: google-github-actions/setup-gcloud@v3
 
+      - name: Resolve project and image
+        run: |
+          project="${{ steps.auth.outputs.project_id }}"
+          echo "GCP_PROJECT_ID=$project" >> "$GITHUB_ENV"
+          echo "IMAGE=$REGION-docker.pkg.dev/$project/$GAR_REPOSITORY/$SERVICE:${{ github.sha }}" >> "$GITHUB_ENV"
+
       - name: Build and push image
         run: |
-          gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+          gcloud artifacts repositories describe "$GAR_REPOSITORY" --location "$REGION" >/dev/null 2>&1             || gcloud artifacts repositories create "$GAR_REPOSITORY" --repository-format docker --location "$REGION" --quiet
+          gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
 
@@ -116,7 +119,7 @@ jobs:
           DB_MAX_OVERFLOW: ${{ vars.DB_MAX_OVERFLOW || '5' }}
           DB_ECHO: ${{ vars.DB_ECHO || 'false' }}
           RUN_MIGRATIONS_ON_STARTUP: ${{ vars.RUN_MIGRATIONS_ON_STARTUP || 'true' }}
-          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID || env.GCP_PROJECT_ID }}
           FIREBASE_CREDENTIALS_BASE64: ${{ secrets.FIREBASE_CREDENTIALS_BASE64 }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
           CACHE_TTL_SECONDS: ${{ vars.CACHE_TTL_SECONDS || '600' }}
@@ -139,16 +142,16 @@ jobs:
             '$ARGS.named | map_values(gsub("^\\s+|\\s+$"; "")) | with_entries(select(.value != ""))' > "$RUNNER_TEMP/runtime-env.yaml"
 
       - name: Deploy Cloud Run service
+        env:
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
         run: |
-          gcloud run deploy "${{ vars.CLOUD_RUN_SERVICE }}" \
-            --image "$IMAGE" \
-            --region "${{ vars.GCP_REGION }}" \
-            --service-account "${{ vars.GCP_SERVICE_ACCOUNT }}" \
-            --env-vars-file "$RUNNER_TEMP/runtime-env.yaml" \
-            --allow-unauthenticated \
-            --quiet
+          args=()
+          if [ -n "$GCP_SERVICE_ACCOUNT" ]; then
+            args+=(--service-account "$GCP_SERVICE_ACCOUNT")
+          fi
+          gcloud run deploy "$SERVICE"             --image "$IMAGE"             --region "$REGION"             --env-vars-file "$RUNNER_TEMP/runtime-env.yaml"             --allow-unauthenticated             "${args[@]}"             --quiet
 
       - name: Smoke test
         run: |
-          url=$(gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE }}" --region "${{ vars.GCP_REGION }}" --format 'value(status.url)')
+          url=$(gcloud run services describe "$SERVICE" --region "$REGION" --format 'value(status.url)')
           curl --fail --silent --show-error --retry 5 --retry-delay 3 "$url/health/ready"

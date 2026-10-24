@@ -102,4 +102,4 @@ uv run pytest
 
 ## Deployment
 
-`.github/workflows/deploy.yml` runs lint, tests and `alembic check` on every PR and deploys `main` to Cloud Run (same setup as `project-study-api`: `GCP_CREDENTIALS` and `DATABASE_URL` secrets (plus optional `REDIS_URL`), `GCP_PROJECT_ID`, `GCP_REGION`, `GAR_REPOSITORY`, `CLOUD_RUN_SERVICE`, `GCP_SERVICE_ACCOUNT`, `FIREBASE_PROJECT_ID` variables in the `development` environment).
+`.github/workflows/deploy.yml` runs lint, tests and `alembic check` on every PR and deploys `main` to Cloud Run in `southamerica-east1`. Only the `GCP_CREDENTIALS` and `DATABASE_URL` secrets (plus optional `REDIS_URL`) are required in the `development` environment; the project id comes from the credentials. Optional variables: `CLOUD_RUN_SERVICE` and `GAR_REPOSITORY` (default `project-barber-api`; the repository is created if missing), `GCP_SERVICE_ACCOUNT`, `FIREBASE_PROJECT_ID` (defaults to the GCP project).
