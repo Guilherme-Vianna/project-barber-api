@@ -1,0 +1,154 @@
+name: CI and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/app_test
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/app_test
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Tests
+        run: uv run pytest -q
+
+      - name: Migrations match models
+        run: |
+          uv run alembic upgrade head
+          uv run alembic check
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: test
+    runs-on: ubuntu-latest
+    environment: development
+    concurrency:
+      group: deploy-development
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/${{ vars.CLOUD_RUN_SERVICE }}:${{ github.sha }}
+    steps:
+      - name: Check configuration
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+          CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+        run: |
+          missing=()
+          for name in GCP_CREDENTIALS DATABASE_URL GCP_PROJECT_ID GCP_REGION GAR_REPOSITORY \
+            CLOUD_RUN_SERVICE GCP_SERVICE_ACCOUNT FIREBASE_PROJECT_ID; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing secrets/variables in the 'development' environment: ${missing[*]}"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build and push image
+        run: |
+          gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Write runtime environment
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          APP_NAME: ${{ vars.APP_NAME || 'project-barber-api' }}
+          API_V1_PREFIX: ${{ vars.API_V1_PREFIX || '/api/v1' }}
+          CORS_ORIGINS: ${{ vars.CORS_ORIGINS || '*' }}
+          TIME_ZONE: ${{ vars.TIME_ZONE || 'America/Sao_Paulo' }}
+          DB_POOL_SIZE: ${{ vars.DB_POOL_SIZE || '5' }}
+          DB_MAX_OVERFLOW: ${{ vars.DB_MAX_OVERFLOW || '5' }}
+          DB_ECHO: ${{ vars.DB_ECHO || 'false' }}
+          RUN_MIGRATIONS_ON_STARTUP: ${{ vars.RUN_MIGRATIONS_ON_STARTUP || 'true' }}
+          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          FIREBASE_CREDENTIALS_BASE64: ${{ secrets.FIREBASE_CREDENTIALS_BASE64 }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          CACHE_TTL_SECONDS: ${{ vars.CACHE_TTL_SECONDS || '600' }}
+        run: |
+          jq -n \
+            --arg ENVIRONMENT development \
+            --arg APP_NAME "$APP_NAME" \
+            --arg API_V1_PREFIX "$API_V1_PREFIX" \
+            --arg CORS_ORIGINS "$CORS_ORIGINS" \
+            --arg TIME_ZONE "$TIME_ZONE" \
+            --arg DATABASE_URL "$DATABASE_URL" \
+            --arg DB_POOL_SIZE "$DB_POOL_SIZE" \
+            --arg DB_MAX_OVERFLOW "$DB_MAX_OVERFLOW" \
+            --arg DB_ECHO "$DB_ECHO" \
+            --arg RUN_MIGRATIONS_ON_STARTUP "$RUN_MIGRATIONS_ON_STARTUP" \
+            --arg FIREBASE_PROJECT_ID "$FIREBASE_PROJECT_ID" \
+            --arg FIREBASE_CREDENTIALS_BASE64 "$FIREBASE_CREDENTIALS_BASE64" \
+            --arg REDIS_URL "$REDIS_URL" \
+            --arg CACHE_TTL_SECONDS "$CACHE_TTL_SECONDS" \
+            '$ARGS.named | map_values(gsub("^\\s+|\\s+$"; "")) | with_entries(select(.value != ""))' > "$RUNNER_TEMP/runtime-env.yaml"
+
+      - name: Deploy Cloud Run service
+        run: |
+          gcloud run deploy "${{ vars.CLOUD_RUN_SERVICE }}" \
+            --image "$IMAGE" \
+            --region "${{ vars.GCP_REGION }}" \
+            --service-account "${{ vars.GCP_SERVICE_ACCOUNT }}" \
+            --env-vars-file "$RUNNER_TEMP/runtime-env.yaml" \
+            --allow-unauthenticated \
+            --quiet
+
+      - name: Smoke test
+        run: |
+          url=$(gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE }}" --region "${{ vars.GCP_REGION }}" --format 'value(status.url)')
+          curl --fail --silent --show-error --retry 5 --retry-delay 3 "$url/health/ready"
